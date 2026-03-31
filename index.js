@@ -34,37 +34,12 @@ function extractFirstJsonObject(text) {
   return text.slice(firstBrace, lastBrace + 1);
 }
 
-function basicRepairJson(text) {
-  if (!text || typeof text !== "string") return text;
-
-  let repaired = text;
-
-  repaired = repaired.replace(/[\u201C\u201D]/g, '"');
-  repaired = repaired.replace(/[\u2018\u2019]/g, "'");
-  repaired = repaired.replace(/,\s*}/g, "}");
-  repaired = repaired.replace(/,\s*]/g, "]");
-  repaired = repaired.replace(/\\n\\t/g, " ");
-  repaired = repaired.replace(/\r/g, " ");
-  repaired = repaired.replace(/\n/g, " ");
-  repaired = repaired.replace(/\t/g, " ");
-  repaired = repaired.replace(/\s+/g, " ").trim();
-
-  return repaired;
-}
-
 function normalizeAnalysis(analysis) {
-  const safeRecipeTitle =
-    analysis &&
-    typeof analysis.recipeTitle === "string" &&
-    analysis.recipeTitle.trim()
-      ? analysis.recipeTitle.trim()
-      : "Recipe";
-
   const rawSteps = Array.isArray(analysis && analysis.steps)
     ? analysis.steps
     : [];
 
-  const steps = rawSteps.map((step, index) => ({
+  const normalizedSteps = rawSteps.map((step, index) => ({
     stepNumber:
       Number(step && step.stepNumber) > 0
         ? Number(step.stepNumber)
@@ -87,15 +62,17 @@ function normalizeAnalysis(analysis) {
         : "cook"
   }));
 
-  const totalEstimatedSeconds = steps.reduce(
-    (sum, step) => sum + step.durationSeconds,
-    0
-  );
-
   return {
-    recipeTitle: safeRecipeTitle,
-    totalEstimatedSeconds,
-    steps
+    recipeTitle:
+      typeof (analysis && analysis.recipeTitle) === "string" &&
+      analysis.recipeTitle.trim()
+        ? analysis.recipeTitle.trim()
+        : "Recipe",
+    totalEstimatedSeconds: normalizedSteps.reduce(
+      (sum, step) => sum + step.durationSeconds,
+      0
+    ),
+    steps: normalizedSteps
   };
 }
 
@@ -113,16 +90,16 @@ app.post("/analyzeRecipeTimer", async (req, res) => {
       ? ingredients.join(", ")
       : String(ingredients);
 
-    const safeInstructions =
-      String(instructions).length > 3500
-        ? String(instructions).slice(0, 3500)
+    const shortInstructions =
+      String(instructions).length > 2500
+        ? String(instructions).slice(0, 2500)
         : String(instructions);
 
     const prompt = `
-Return ONLY one valid JSON object.
-Do not include markdown, code fences, comments, notes, or explanation text.
+Return ONLY valid JSON.
+Do not include markdown, explanation, notes, or code fences.
 
-Use exactly this schema:
+JSON format:
 {
   "recipeTitle": "string",
   "totalEstimatedSeconds": number,
@@ -137,67 +114,61 @@ Use exactly this schema:
   ]
 }
 
-Rules:
-- Keep all fields present.
-- stepNumber starts from 1 and increases by 1.
-- durationSeconds must be a positive integer.
-- totalEstimatedSeconds must equal the sum of all step durationSeconds.
-- instruction must be short, clear, and valid JSON string text.
-- Each step should summarize one cooking action.
-- Do not return any extra keys.
-
 Recipe title: ${title}
 Ingredients: ${ingredientsText}
-Instructions: ${safeInstructions}
+Instructions: ${shortInstructions}
 `;
 
-    const timeoutPromise = (ms) =>
-      new Promise((_, reject) => {
-        setTimeout(() => reject(new Error("DeepSeek request timed out")), ms);
-      });
+    const timeoutPromise = new Promise((_, reject) => {
+      setTimeout(() => reject(new Error("DeepSeek request timed out")), 90000);
+    });
 
-    const response = await Promise.race([
-      fetch("https://api.deepseek.com/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          model: "deepseek-chat",
-          messages: [
-            {
-              role: "system",
-              content:
-                "You are a recipe time estimation assistant. Return only one valid JSON object. No markdown. No explanation."
-            },
-            {
-              role: "user",
-              content: prompt
-            }
-          ],
-          temperature: 0.1,
-          max_tokens: 900,
-          response_format: { type: "json_object" }
-        })
-      }),
-      timeoutPromise(120000)
-    ]);
+    const fetchPromise = fetch("https://api.deepseek.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.DEEPSEEK_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "deepseek-chat",
+        messages: [
+          {
+            role: "system",
+            content:
+              "You are a recipe time estimation assistant. Return only valid JSON."
+          },
+          {
+            role: "user",
+            content: prompt
+          }
+        ],
+        temperature: 0.1,
+        max_tokens: 800
+      })
+    });
 
+    const response = await Promise.race([fetchPromise, timeoutPromise]);
     const data = await response.json();
 
     if (!response.ok) {
+      console.error("DeepSeek API error:", data);
       return res.status(response.status).json({
         error: "DeepSeek API request failed",
         details: data
       });
     }
 
-    const content = data && data.choices && data.choices && data.choices.message
-      ? data.choices.message.content
-      : null;
+    const content =
+      data &&
+      data.choices &&
+      data.choices &&
+      data.choices.message &&
+      data.choices.message.content
+        ? data.choices.message.content
+        : null;
 
-    if (!content) {
+    if (!content || !content.trim()) {
+      console.error("No content from DeepSeek:", data);
       return res.status(500).json({
         error: "No content returned from DeepSeek",
         details: data
@@ -208,29 +179,19 @@ Instructions: ${safeInstructions}
     const extractedJson = extractFirstJsonObject(cleanedContent);
 
     let analysis;
-
     try {
       analysis = JSON.parse(extractedJson);
-    } catch (firstParseError) {
-      try {
-        const repairedJson = basicRepairJson(extractedJson);
-        analysis = JSON.parse(repairedJson);
-      } catch (secondParseError) {
-        console.error("Raw AI content:", content);
-        console.error("Cleaned AI content:", cleanedContent);
-        console.error("Extracted JSON:", extractedJson);
-        console.error("First parse error:", firstParseError.message);
-        console.error("Second parse error:", secondParseError.message);
+    } catch (parseError) {
+      console.error("Raw AI content:", content);
+      console.error("Cleaned AI content:", cleanedContent);
+      console.error("Extracted JSON:", extractedJson);
+      console.error("JSON parse error:", parseError.message);
 
-        return res.status(500).json({
-          error: "Failed to parse DeepSeek JSON response",
-          firstParseMessage: firstParseError.message,
-          secondParseMessage: secondParseError.message,
-          rawContent: content,
-          cleanedContent,
-          extractedJson
-        });
-      }
+      return res.status(500).json({
+        error: "Failed to parse DeepSeek JSON response",
+        parseMessage: parseError.message,
+        rawContent: content
+      });
     }
 
     const normalized = normalizeAnalysis(analysis);
