@@ -39,21 +39,49 @@ function extractFirstJsonObject(text) {
   return text.slice(firstBrace, lastBrace + 1);
 }
 
+function basicRepairJson(text) {
+  if (!text || typeof text !== "string") return text;
+
+  let repaired = text;
+
+  repaired = repaired.replace(/[“”]/g, '"');
+  repaired = repaired.replace(/[‘’]/g, "'");
+  repaired = repaired.replace(/,\s*}/g, "}");
+  repaired = repaired.replace(/,\s*]/g, "]");
+  repaired = repaired.replace(/\r/g, " ");
+  repaired = repaired.replace(/\t/g, " ");
+  repaired = repaired.trim();
+
+  return repaired;
+}
+
 function normalizeAnalysis(analysis) {
-  const safeRecipeTitle = analysis && 
-    typeof analysis.recipeTitle === "string" && 
-    analysis.recipeTitle.trim() 
-    ? analysis.recipeTitle.trim() 
-    : "Recipe";
+  const safeRecipeTitle =
+    analysis &&
+    typeof analysis.recipeTitle === "string" &&
+    analysis.recipeTitle.trim()
+      ? analysis.recipeTitle.trim()
+      : "Recipe";
 
   const rawSteps = Array.isArray(analysis?.steps) ? analysis.steps : [];
 
   const normalizedSteps = rawSteps.map((step, index) => ({
-    stepNumber: Number(step?.stepNumber) > 0 ? Number(step.stepNumber) : index + 1,
-    title: typeof step?.title === "string" && step.title.trim() ? step.title.trim() : `Step ${index + 1}`,
-    instruction: typeof step?.instruction === "string" && step.instruction.trim() ? step.instruction.trim() : "No instruction",
-    durationSeconds: Number(step?.durationSeconds) > 0 ? Number(step.durationSeconds) : 10,
-    type: typeof step?.type === "string" && step.type.trim() ? step.type.trim() : "cook"
+    stepNumber:
+      Number(step?.stepNumber) > 0 ? Number(step.stepNumber) : index + 1,
+    title:
+      typeof step?.title === "string" && step.title.trim()
+        ? step.title.trim()
+        : `Step ${index + 1}`,
+    instruction:
+      typeof step?.instruction === "string" && step.instruction.trim()
+        ? step.instruction.trim()
+        : "No instruction",
+    durationSeconds:
+      Number(step?.durationSeconds) > 0 ? Number(step.durationSeconds) : 10,
+    type:
+      typeof step?.type === "string" && step.type.trim()
+        ? step.type.trim()
+        : "cook"
   }));
 
   const totalEstimatedSeconds = normalizedSteps.reduce(
@@ -82,12 +110,14 @@ app.post("/analyzeRecipeTimer", async (req, res) => {
       ? ingredients.join(", ")
       : String(ingredients);
 
-    const shortInstructions = String(instructions).length > 2500
-      ? String(instructions).slice(0, 2500)
-      : String(instructions);
+    const shortInstructions =
+      String(instructions).length > 3500
+        ? String(instructions).slice(0, 3500)
+        : String(instructions);
 
     const prompt = `
-Return ONLY valid JSON.
+Return ONLY one valid JSON object.
+Do not include markdown, code fences, comments, notes, or explanation.
 
 Required JSON format:
 {
@@ -103,6 +133,17 @@ Required JSON format:
     }
   ]
 }
+
+Rules:
+- Keep all fields present.
+- stepNumber starts from 1 and increases by 1.
+- durationSeconds must be a positive integer.
+- totalEstimatedSeconds must equal the sum of all step durationSeconds.
+- instruction must be short and clear.
+- Merge very small actions into practical timer steps.
+- Prefer 8 to 12 steps, but do not exceed 15 steps.
+- Use "prep", "cook", or "serve" only for type.
+- Do not return any extra keys.
 
 Recipe title: ${title}
 Ingredients: ${ingredientsText}
@@ -124,7 +165,8 @@ Instructions: ${shortInstructions}
         messages: [
           {
             role: "system",
-            content: "You are a recipe time estimation assistant. Return only valid JSON."
+            content:
+              "You are a recipe time estimation assistant. Return only one valid JSON object."
           },
           {
             role: "user",
@@ -132,7 +174,9 @@ Instructions: ${shortInstructions}
           }
         ],
         temperature: 0.1,
-        max_tokens: 800
+        max_tokens: 1000,
+        response_format: { type: "json_object" },
+        stream: false
       })
     });
 
@@ -166,19 +210,28 @@ Instructions: ${shortInstructions}
     const cleanedContent = cleanModelOutput(rawContent);
     const extractedJson = extractFirstJsonObject(cleanedContent);
 
-    console.log("CLEANED CONTENT (first 200 chars):", cleanedContent.substring(0, 200));
+    console.log(
+      "CLEANED CONTENT (first 200 chars):",
+      cleanedContent.substring(0, 200)
+    );
 
     let analysis;
     try {
       analysis = JSON.parse(extractedJson);
-    } catch (parseError) {
-      return res.status(500).json({
-        error: "Failed to parse DeepSeek JSON response",
-        parseMessage: parseError.message,
-        rawContent: rawContent,
-        cleanedContent: cleanedContent,
-        extractedJson: extractedJson
-      });
+    } catch (firstParseError) {
+      try {
+        const repairedJson = basicRepairJson(extractedJson);
+        analysis = JSON.parse(repairedJson);
+      } catch (secondParseError) {
+        return res.status(500).json({
+          error: "Failed to parse DeepSeek JSON response",
+          firstParseMessage: firstParseError.message,
+          secondParseMessage: secondParseError.message,
+          rawContent: rawContent,
+          cleanedContent: cleanedContent,
+          extractedJson: extractedJson
+        });
+      }
     }
 
     const normalized = normalizeAnalysis(analysis);
